@@ -162,10 +162,10 @@ class DatasetRecordConfig:
     num_episodes: int = 50
     # Encode frames in the dataset into video
     video: bool = True
-    # Upload dataset to Hugging Face hub.
-    push_to_hub: bool = True
+    # Upload dataset to Hugging Face hub. Off by default for lab data; pass --dataset.push_to_hub=true to upload.
+    push_to_hub: bool = False
     # Upload on private repository on the Hugging Face hub.
-    private: bool = False
+    private: bool = True
     # Add tags to your dataset on the hub.
     tags: list[str] | None = None
     # Number of subprocesses handling the saving of frames as PNG. Set to 0 to use threads only;
@@ -201,7 +201,12 @@ class RecordConfig:
     policy: PreTrainedConfig | None = None
     # Display all cameras on screen
 
+    # Wired leader->follower on one CAN bus; the PC only listens (the follower is forced to passive mode).
     direct_record: bool = True
+    # What is stored as `action` in direct_record mode:
+    #   leader_command : control frames the leader sends to the follower on the shared bus (true command)
+    #   follower_state : follower's measured state at the same step (old behaviour; action == observation.state)
+    action_source: str = "leader_command"
 
     display_data: bool = False
     # Display data on a remote Rerun server
@@ -227,6 +232,16 @@ class RecordConfig:
 
         if self.teleop is None and self.policy is None and not self.direct_record:
             raise ValueError("Choose a policy, a teleoperator or both to control the robot, or set direct_record to True")
+
+        if self.action_source not in ("leader_command", "follower_state"):
+            raise ValueError(f"action_source must be 'leader_command' or 'follower_state', got {self.action_source!r}")
+
+        if self.direct_record:
+            if self.teleop is not None:
+                logging.warning("direct_record=True: --teleop.* is ignored. Pass --direct_record=false to use it.")
+            if hasattr(self.robot, "passive"):
+                # The leader drives the follower through the CAN link; the PC must not send commands.
+                self.robot.passive = True
 
     @classmethod
     def __get_path_fields__(cls) -> list[str]:
@@ -263,82 +278,36 @@ class RecordConfig:
                   ( Rerun Log / Loop Wait )
 """
 
-def make_action_from_follower_observation(
+def make_direct_action(
     obs_processed: RobotObservation,
     robot: Robot,
+    action_source: str,
+    max_age_s: float = 0.5,
 ) -> RobotAction:
+    """Action label for direct (wired) recording.
+
+    leader_command: read the leader's joint/gripper control frames from the shared CAN bus. This is what the
+        follower is actually told to do, so action[t] leads observation.state[t] like in normal teleop data.
+    follower_state: copy the follower's current state (action[t] == observation.state[t]). Kept only for
+        comparison / buses where control frames are not visible; it teaches a policy to copy its input.
     """
-    Used in direct wired recording mode.
+    action_keys = list(robot.action_features)
 
-    Since the follower is already moving through the wired leader-to-follower connection, LeRobot saves the follower’s current state as the action label.
+    if action_source == "leader_command":
+        reading = robot.read_command()
+        if not reading.received or reading.age_s() > max_age_s:
+            raise TimeoutError(
+                f"Leader command frames are stale ({reading.age_s():.2f}s). "
+                "Run examples/piper/piper_check.py to confirm they are visible on this bus, "
+                "or use --action_source=follower_state."
+            )
+        return {f"{m}.pos": v for m, v in reading.values.items() if f"{m}.pos" in action_keys}
 
-    """
+    missing = [k for k in action_keys if k not in obs_processed]
+    if missing:
+        raise KeyError(f"Cannot build action from follower observation, missing {missing}")
+    return {k: obs_processed[k] for k in action_keys}
 
-    action_keys = list(robot.action_features.keys())
-
-    # Case 1: When the action keys are directly present in obs_processed
-    if all(k in obs_processed for k in action_keys):
-        return {k: obs_processed[k] for k in action_keys}
-
-    # Case 2: When the joint/gripper values are stored inside the state vector
-    state_key_candidates = [
-        "state",
-        "observation.state",
-        f"{OBS_STR}.state",
-        "robot_state",
-        "joint_positions",
-        "arm_joint_pos",
-    ]
-
-    for state_key in state_key_candidates:
-        if state_key in obs_processed:
-            state = obs_processed[state_key]
-
-            if len(state) < len(action_keys):
-                raise ValueError(
-                    f"State vector is shorter than action dimension.\n"
-                    f"state_key={state_key}\n"
-                    f"state_len={len(state)}\n"
-                    f"action_len={len(action_keys)}\n"
-                    f"action_keys={action_keys}"
-                )
-
-            return {
-                action_key: state[i]
-                for i, action_key in enumerate(action_keys)
-            }
-
-    # Case 3: prefix 붙은 key 탐색
-    action = {}
-    missing = []
-
-    for action_key in action_keys:
-        candidates = [
-            action_key,
-            f"observation.{action_key}",
-            f"{OBS_STR}.{action_key}",
-            f"obs.{action_key}",
-        ]
-
-        found = False
-        for candidate in candidates:
-            if candidate in obs_processed:
-                action[action_key] = obs_processed[candidate]
-                found = True
-                break
-
-        if not found:
-            missing.append(action_key)
-
-    if len(missing) == 0:
-        return action
-
-    raise KeyError(
-        "Cannot make action from follower observation.\n"
-        f"Missing action keys: {missing}\n"
-        f"Action keys: {action_keys}\n"
-        f"Observation keys: {list(obs_processed.keys())}\n"
-    )
 
 @safe_stop_image_writer
 def record_loop(
@@ -364,6 +333,7 @@ def record_loop(
     display_data: bool = False,
     display_compressed_images: bool = False,
     direct_record: bool = False,
+    action_source: str = "leader_command",
 ):
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
@@ -439,10 +409,7 @@ def record_loop(
             # Direct wired recording:
             # Since the follower is already being driven through the wired leader-follower connection,
             # save the follower's current state as the action label.
-            act_processed_teleop = make_action_from_follower_observation(
-                obs_processed,
-                robot,
-            )
+            act_processed_teleop = make_direct_action(obs_processed, robot, action_source)
 
 
         elif policy is None and isinstance(teleop, Teleoperator):
@@ -593,18 +560,19 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                 },
             )
         
-        if cfg.direct_record and hasattr(robot, "bus") and hasattr(robot.bus, "clear_gripper"):
-            logging.info(
-                "[DirectRecord] Skip robot.bus.clear_gripper() "
-                "to avoid disturbing wired leader-follower gripper state."
-            )
-
-            def _skip_clear_gripper():
-                logging.info("[DirectRecord] robot.bus.clear_gripper() skipped.")
-
-            robot.bus.clear_gripper = _skip_clear_gripper
-
         robot.connect(calibrate=False)
+
+        if cfg.direct_record and cfg.action_source == "leader_command":
+            if not hasattr(robot, "read_command"):
+                raise ValueError(f"{robot.name} cannot read leader commands; use --action_source=follower_state")
+            deadline = time.monotonic() + 2.0
+            while not robot.read_command().received and time.monotonic() < deadline:
+                time.sleep(0.01)
+            if not robot.read_command().received:
+                raise RuntimeError(
+                    "No leader control frames seen on the follower bus. Check the wired master/slave setup "
+                    "(examples/piper/piper_check.py) or use --action_source=follower_state."
+                )
 
         if teleop is not None and not cfg.direct_record:
             teleop.connect()
@@ -632,6 +600,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                     display_data=cfg.display_data,
                     display_compressed_images=display_compressed_images,
                     direct_record=cfg.direct_record,
+                    action_source=cfg.action_source,
                 )
 
                 # Execute a few seconds without recording to give time to manually reset the environment
@@ -665,6 +634,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
 
                         display_compressed_images=display_compressed_images,
                         direct_record=cfg.direct_record,
+                        action_source=cfg.action_source,
                     )
 
                 if events["rerecord_episode"]:
@@ -690,7 +660,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if not is_headless() and listener:
             listener.stop()
 
-        if cfg.dataset.push_to_hub:
+        if cfg.dataset.push_to_hub and dataset is not None:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
         log_say("Exiting", cfg.play_sounds)

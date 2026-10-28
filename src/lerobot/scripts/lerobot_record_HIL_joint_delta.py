@@ -160,10 +160,10 @@ class DatasetRecordConfig:
     num_episodes: int = 50
     # Encode frames in the dataset into video
     video: bool = True
-    # Upload dataset to Hugging Face hub.
-    push_to_hub: bool = True
+    # Upload dataset to Hugging Face hub. Off by default for lab data; pass --dataset.push_to_hub=true to upload.
+    push_to_hub: bool = False
     # Upload on private repository on the Hugging Face hub.
-    private: bool = False
+    private: bool = True
     # Add tags to your dataset on the hub.
     tags: list[str] | None = None
     # Number of subprocesses handling the saving of frames as PNG. Set to 0 to use threads only;
@@ -271,6 +271,11 @@ DEFAULT_DELTA_SCALE = {key: 1.0 for key in (*JOINT_POSITION_KEYS, GRIPPER_POSITI
 DEFAULT_DELTA_MAX = {key: None for key in (*JOINT_POSITION_KEYS, GRIPPER_POSITION_KEY)}
 DELTA_SMOOTHING_BETA = None
 
+# Per-frame flag stored in the dataset: 1.0 when the action came from the human (leader), 0.0 from the policy.
+# Not prefixed with "observation."/"action", so policies ignore it; use it to filter / weight corrections.
+INTERVENTION_KEY = "intervention"
+INTERVENTION_FEATURE = {INTERVENTION_KEY: {"dtype": "float32", "shape": (1,), "names": [INTERVENTION_KEY]}}
+
 
 @safe_stop_image_writer
 def record_loop(
@@ -295,7 +300,10 @@ def record_loop(
     single_task: str | None = None,
     display_data: bool = False,
     display_compressed_images: bool = False,
+    force_delta_teleop: bool = False,
 ):
+    """force_delta_teleop: drive the follower with joint-delta teleop for the whole loop. Used for the reset
+    phase so the follower does not jump to the leader's absolute pose right after a policy episode."""
     if dataset is not None and dataset.fps != fps:
         raise ValueError(f"The dataset fps should be equal to requested fps ({dataset.fps} != {fps}).")
 
@@ -346,7 +354,7 @@ def record_loop(
 
         act_processed_policy = None
         act_processed_teleop = None
-        loop_intervention_mode = bool(events["intervention_mode"])
+        loop_intervention_mode = force_delta_teleop or bool(events.get("intervention_mode", False))
         if events["exit_early"]:
             events["exit_early"] = False
             break
@@ -442,10 +450,13 @@ def record_loop(
             act_processed_teleop = teleop_action_processor((act, obs))
         else:
             logging.info(
-                "No policy or teleoperator provided, skipping action generation."
-                "This is likely to happen when resetting the environment without a teleop device."
+                "No policy or teleoperator provided, skipping action generation. "
+                "This is likely to happen when resetting the environment without a teleop device. "
                 "The robot won't be at its rest position at the start of the next episode."
             )
+            dt_s = time.perf_counter() - start_loop_t
+            precise_sleep(max(1 / fps - dt_s, 0.0))
+            timestamp = time.perf_counter() - start_episode_t
             continue
 
 
@@ -474,6 +485,9 @@ def record_loop(
         if dataset is not None:
             action_frame = build_dataset_frame(dataset.features, action_values, prefix=ACTION)
             frame = {**observation_frame, **action_frame, "task": single_task}
+            if INTERVENTION_KEY in dataset.features:
+                human = act_processed_policy is None
+                frame[INTERVENTION_KEY] = np.array([1.0 if human else 0.0], dtype=np.float32)
             dataset.add_frame(frame)
 
         if display_data:
@@ -627,6 +641,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
             initial_features=create_initial_features(observation=robot.observation_features),
             use_videos=cfg.dataset.video,
         ),
+        INTERVENTION_FEATURE,
     )
 
     dataset = None
@@ -728,6 +743,8 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
                         control_time_s=cfg.dataset.reset_time_s,
                         single_task=cfg.dataset.single_task,
                         display_data=cfg.display_data,
+                        # leader and follower poses differ after a policy episode -> relative mapping
+                        force_delta_teleop=isinstance(teleop, Teleoperator),
                     )
 
                 if events["rerecord_episode"]:
@@ -753,7 +770,7 @@ def record(cfg: RecordConfig) -> LeRobotDataset:
         if not is_headless() and listener:
             listener.stop()
 
-        if cfg.dataset.push_to_hub:
+        if cfg.dataset.push_to_hub and dataset is not None:
             dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
 
         log_say("Exiting", cfg.play_sounds)

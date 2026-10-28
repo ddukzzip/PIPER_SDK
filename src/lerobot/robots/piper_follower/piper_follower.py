@@ -1,26 +1,33 @@
 #!/usr/bin/env python
 
-# Copyright 2025 WeGo-Robotics Inc. EDU team. All rights reserved.
-
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
 # You may obtain a copy of the License at
-
+#
 #     http://www.apache.org/licenses/LICENSE-2.0
-
+#
 # Unless required by applicable law or agreed to in writing, software
 # distributed under the License is distributed on an "AS IS" BASIS,
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+"""AgileX PiPER follower arm.
+
+Implements the LeRobot `Robot` interface directly on top of piper_sdk (through the thin `PiperArm`
+helper). There is no MotorsBus layer and no -100..100 normalisation:
+
+    observation / action keys : joint1.pos ... joint6.pos  [deg],  gripper.pos  [mm]
+
+Policies normalise with dataset statistics, so physical units can be fed to them directly.
+"""
+
 import logging
 import time
 from functools import cached_property
 
 from lerobot.cameras.utils import make_cameras_from_configs
-from lerobot.motors import Motor, MotorCalibration, MotorNormMode
-from lerobot.motors.piper import PiperMotorsBus
+from lerobot.motors.piper import MOTOR_NAMES, ArmReading, PiperArm
 from lerobot.processor import RobotAction, RobotObservation
 from lerobot.utils.decorators import check_if_already_connected, check_if_not_connected
 
@@ -30,169 +37,152 @@ from .config_piper_follower import PiperFollowerConfig
 
 logger = logging.getLogger(__name__)
 
+
 class PiperFollower(Robot):
-
-    # Set these in ALL subclasses
-
-    config_class: PiperFollowerConfig
+    config_class = PiperFollowerConfig
     name = "piper_follower"
-
-    # cameras : dict[str, Camera] = {}
-
 
     def __init__(self, config: PiperFollowerConfig):
         super().__init__(config)
         self.config = config
-        self.id = config.id
-        self.port = config.port
-        norm_mode_body = MotorNormMode.DEGREES if config.use_degrees else MotorNormMode.RANGE_M100_100
-        self.bus = PiperMotorsBus(
-            id=config.id,
-            port=self.config.port,
-            motors={
-                "joint1": Motor(1, "AGILEX-M", norm_mode_body),
-                "joint2": Motor(2, "AGILEX-M", norm_mode_body),
-                "joint3": Motor(3, "AGILEX-M", norm_mode_body),
-                "joint4": Motor(4, "AGILEX-S", norm_mode_body),
-                "joint5": Motor(5, "AGILEX-S", norm_mode_body),
-                "joint6": Motor(6, "AGILEX-S", norm_mode_body),
-                "gripper": Motor(7, "AGILEX-S", MotorNormMode.RANGE_0_100),
-            },
-            calibration={
-                "joint1": MotorCalibration(1, 0, 0, -150000, 150000),
-                "joint2": MotorCalibration(2, 0, 0,       0, 180000),
-                "joint3": MotorCalibration(3, 0, 0, -170000, 0     ),
-                "joint4": MotorCalibration(4, 0, 0, -100000, 100000),
-                "joint5": MotorCalibration(5, 0, 0,  -65000, 65000 ),
-                "joint6": MotorCalibration(6, 0, 0, -100000, 130000),
-                "gripper": MotorCalibration(7, 0, 0, 0, 100000),
-            }
-        )
+        self.arm = PiperArm(config.port, judge_flag=config.judge_flag)
         self.cameras = make_cameras_from_configs(config.cameras)
 
-    def __str__(self) -> str:
-        return f"{self.id} {self.__class__.__name__}"
-
+    # ------------------------------------------------------------------ features
     @property
     def _motors_ft(self) -> dict[str, type]:
-        return {f"{motor}.pos": float for motor in self.bus.motors}
+        return {f"{m}.pos": float for m in MOTOR_NAMES}
 
     @property
     def _cameras_ft(self) -> dict[str, tuple]:
         return {
-            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras}
+            cam: (self.config.cameras[cam].height, self.config.cameras[cam].width, 3) for cam in self.cameras
+        }
 
     @cached_property
     def observation_features(self) -> dict[str, type | tuple]:
-       return {**self._motors_ft, **self._cameras_ft}
+        return {**self._motors_ft, **self._cameras_ft}
 
     @cached_property
     def action_features(self) -> dict[str, type]:
         return self._motors_ft
 
+    # ------------------------------------------------------------------ connection
     @property
     def is_connected(self) -> bool:
-        return self.bus.is_connected and all(cam.is_connected for cam in self.cameras.values())
-        # return self.bus.is_connected
+        return self.arm.is_connected and all(cam.is_connected for cam in self.cameras.values())
 
     @check_if_already_connected
     def connect(self, calibrate: bool = True) -> None:
-        """
-        We assume that at connection time, arm is in a rest position,
-        and torque can be safely disabled to run calibration.
-        """
+        self.arm.connect(wait_for="feedback")
 
-        self.bus.connect()
-
-        # if not self.bus.enable_torque():
-        #     logger.info(f"{self} retry torque on.")
-        
-        if calibrate:
-            logger.info(f"{self} go to origin.")
-            self.bus.parking()
+        if not self.config.passive:
+            if self.config.enable_on_connect and not self.arm.enable():
+                self.arm.disconnect()
+                raise ConnectionError(f"{self}: failed to enable motors.")
+            if calibrate and self.config.home_on_connect:
+                logger.info(f"{self}: moving to home position.")
+                self.arm.move_to(
+                    self.config.home_position,
+                    self.config.speed_rate,
+                    self.config.gripper_effort,
+                    timeout_s=self.config.home_timeout_s,
+                )
 
         for cam in self.cameras.values():
             cam.connect()
-
-        logger.info(f"{self} connected.")
-        print('follower connected, enabling torque...')
+        logger.info(f"{self} connected (passive={self.config.passive}).")
 
     @property
     def is_calibrated(self) -> bool:
-        return self.bus.is_calibrated
-
-    def calibrate(self) -> None:
-        self.bus.clear_gripper()
+        # Joint zero is stored in the PiPER controller; nothing to calibrate from LeRobot.
         return True
 
-    def _load_calibration(self, fpath: Path | None = None) -> None:
-        pass
-
-    def _save_calibration(self, fpath: Path | None = None) -> None:
+    def calibrate(self) -> None:
         pass
 
     def configure(self) -> None:
         pass
 
     def setup_motors(self) -> None:
-        self.bus.connect()
-        self.bus.set_slave()
+        """One-time: configure this arm as slave (motion output arm)."""
+        was_connected = self.arm.is_connected
+        if not was_connected:
+            self.arm.connect(wait_for=None)
+        self.arm.set_role("slave")
+        logger.info(f"{self}: set as slave. Power-cycle the arm if it was previously a master.")
+        if not was_connected:
+            self.arm.disconnect()
+
+    # ------------------------------------------------------------------ io
+    def _fresh(self, reading: ArmReading, what: str) -> ArmReading:
+        age = reading.age_s()
+        if not reading.received or age > self.config.max_feedback_age_s:
+            raise TimeoutError(f"{self}: {what} is stale ({age:.2f}s old). Is the CAN link alive?")
+        return reading
+
+    def read_state(self) -> dict[str, float]:
+        """Measured joint/gripper state in deg/mm, without `.pos` suffix."""
+        return self._fresh(self.arm.read("feedback"), "feedback").values
+
+    def read_command(self) -> ArmReading:
+        """Control frames seen on this CAN bus (deg/mm). In single-port wired mode these are the leader's
+        commands to the follower; check `.received` / `.age_s()` before using them."""
+        return self.arm.read("command")
 
     @check_if_not_connected
     def get_observation(self) -> RobotObservation:
-
-        obs_dict = {} 
-
-        # Read arm position
         start = time.perf_counter()
-        obs_dict = self.bus.get_action()
-        obs_dict = {f"{motor}.pos": val for motor, val in obs_dict.items()}
-        dt_ms = (time.perf_counter() - start) * 1e3
-        logger.debug(f"{self} read state: {dt_ms:.1f}ms")
+        obs: RobotObservation = {f"{m}.pos": v for m, v in self.read_state().items()}
+        logger.debug(f"{self} read state: {(time.perf_counter() - start) * 1e3:.1f}ms")
 
-        # Capture images from cameras
         for cam_key, cam in self.cameras.items():
             start = time.perf_counter()
-            obs_dict[cam_key] = cam.async_read()
-            dt_ms = (time.perf_counter() - start) * 1e3
-            logger.debug(f"{self} read {cam_key}: {dt_ms:.1f}ms")
-
-        return obs_dict
+            obs[cam_key] = cam.async_read()
+            logger.debug(f"{self} read {cam_key}: {(time.perf_counter() - start) * 1e3:.1f}ms")
+        return obs
 
     @check_if_not_connected
     def send_action(self, action: RobotAction) -> RobotAction:
+        if self.config.passive:
+            raise RuntimeError(f"{self} is passive (driven by a wired leader); it does not accept actions.")
 
-        goal_pos = {}
-        for key, val in action.items():
-            if key.endswith(".pos"):
-                goal_pos[key.removesuffix(".pos")] = val
-            else:
-                goal_pos[key] = val
+        goal = {
+            k.removesuffix(".pos"): float(v)
+            for k, v in action.items()
+            if k.removesuffix(".pos") in MOTOR_NAMES
+        }
 
-        # Cap goal position when too far away from present position.
-        # /!\ Slower fps expected due to reading from the follower.
         if self.config.max_relative_target is not None:
-            present_pos = self.bus.sync_read("Present_Position")
-            goal_present_pos = {key: (g_pos, present_pos[key]) for key, g_pos in goal_pos.items()}
-            goal_pos = ensure_safe_goal_position(goal_present_pos, self.config.max_relative_target)
+            present = self.read_state()
+            goal = ensure_safe_goal_position(
+                {k: (g, present[k]) for k, g in goal.items()}, self.config.max_relative_target
+            )
 
-        self.bus.set_action(goal_pos, is_conv=True)
-        return {f"{motor}.pos": val for motor, val in goal_pos.items()}
+        sent = self.arm.send(goal, self.config.speed_rate, self.config.gripper_effort)
+        return {f"{m}.pos": v for m, v in sent.items()}
 
-    def parking(self):
-        self.bus.parking()
+    def move_home(self) -> bool:
+        return self.arm.move_to(
+            self.config.home_position,
+            self.config.speed_rate,
+            self.config.gripper_effort,
+            timeout_s=self.config.home_timeout_s,
+        )
 
     @check_if_not_connected
-    def disconnect(self, disable_torque: bool = False) -> None:
-        self.bus.disconnect(disable_torque)
-
-
-    def get_status(self):
-        rlt = {
-            print(self.bus.piper.GetArmGripperMsgs()),
-            print(self.bus.piper.GetArmGripperCtrl()),
-        }
-        return rlt
-
-    def get_fk(self, mode: str = "feedback"):
-        return self.bus.piper.GetFK(mode)
+    def disconnect(self) -> None:
+        try:
+            if not self.config.passive:
+                if self.config.home_on_disconnect and not self.move_home():
+                    logger.warning(
+                        f"{self}: did not reach home; keeping torque ON to avoid dropping the arm."
+                    )
+                elif self.config.disable_torque_on_disconnect:
+                    self.arm.disable()
+        finally:
+            for cam in self.cameras.values():
+                if cam.is_connected:
+                    cam.disconnect()
+            self.arm.disconnect()
+            logger.info(f"{self} disconnected.")
