@@ -1,0 +1,11 @@
+python src/lerobot/scripts/lerobot_record_singleport.py \
+  --robot.type=piper_follower \
+  --robot.port=can0 \
+  --robot.id=follower \
+  --dataset.repo_id=your_HF_id/your_repo_id \
+  --dataset.single_task="Pick up the ball and place it in the drop zone." \
+  --dataset.num_episodes=10 \
+  --dataset.episode_time_s=60 \
+  --dataset.reset_time_s=10 \
+  --dataset.fps=10 \
+  --display_data=true
